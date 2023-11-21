@@ -18,9 +18,12 @@ package resources
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline"
 	v1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
@@ -34,6 +37,10 @@ import (
 const (
 	// objectIndividualVariablePattern is the reference pattern for object individual keys params.<object_param_name>.<key_name>
 	objectIndividualVariablePattern = "params.%s.%s"
+)
+
+const (
+	envVarPrefix = "PARAMS_"
 )
 
 var (
@@ -95,6 +102,127 @@ func getTaskParameters(spec *v1.TaskSpec, tr *v1.TaskRun, defaults ...v1.ParamSp
 	}
 	return stringReplacements, arrayReplacements, objectReplacements
 }
+
+// convertToShellEnvVarFormat converts a string to match the environment variable format.
+func convertToShellEnvVarFormat(s string, usePrefix bool) string {
+	prefix := ""
+	if usePrefix {
+		prefix = envVarPrefix
+	}
+	reg := regexp.MustCompile(`[^a-zA-Z0-9]+`) // TODO(aaron-prindle) add "." char as well?
+	return strings.ToUpper(reg.ReplaceAllString(prefix+s, "_"))
+}
+
+// =====================================================
+// =====================================================
+func ApplyParametersAsEnvVars(ctx context.Context, spec *v1.TaskSpec, tr *v1.TaskRun, defaults ...v1.ParamSpec) *v1.TaskSpec {
+	envVars := []corev1.EnvVar{}
+	// stringReplacements is used for standard single-string stringReplacements, while arrayReplacements contains arrays
+	// that need to be further processed.
+	stringReplacements := map[string]string{}
+	arrayReplacements := map[string][]string{}
+
+	// Function to add parameter as an environment variable
+	addParamAsEnvVar := func(name, value string, usePrefix bool) {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  convertToShellEnvVarFormat(name, usePrefix),
+			Value: value,
+		})
+	}
+
+	// Process default parameters
+	// This assumes that the TaskRun inputs have been validated against what the Task requests.
+	for _, p := range defaults {
+		if p.Default != nil {
+			switch p.Default.Type {
+			case v1.ParamTypeArray:
+				for _, pattern := range paramPatterns {
+					for i := 0; i < len(p.Default.ArrayVal); i++ {
+						addParamAsEnvVar(fmt.Sprintf(p.Name+"_%d", i), p.Default.ArrayVal[i], true)
+						stringReplacements[fmt.Sprintf(pattern+"_%d", p.Name, i)] = p.Default.ArrayVal[i]
+						// stringReplacements[fmt.Sprintf(pattern+"[%d]", p.Name, i)] = p.Default.ArrayVal[i]
+					}
+					// Here we're joining array values with comma, you can choose another separator if needed
+					addParamAsEnvVar(p.Name, strings.Join(p.Default.ArrayVal, ","), true)
+					arrayReplacements[fmt.Sprintf(pattern, p.Name)] = p.Default.ArrayVal
+				}
+			case v1.ParamTypeObject:
+				// Converting object to a string, you might want to serialize it differently
+				jsonValue, _ := json.Marshal(p.Default.ObjectVal)
+				addParamAsEnvVar(p.Name, string(jsonValue), true)
+				// for _, pattern := range paramPatterns {
+				// 	objectReplacements[fmt.Sprintf(pattern, p.Name)] = p.Default.ObjectVal
+				// }
+
+				for k, v := range p.Default.ObjectVal {
+					// TODO(aaron-prindle) maybe need more here?...
+					// addParamAsEnvVar(p.Name, string(jsonValue), true)
+					stringReplacements[fmt.Sprintf(objectIndividualVariablePattern, p.Name, k)] = v
+				}
+			case v1.ParamTypeString:
+				fallthrough
+			default:
+				addParamAsEnvVar(p.Name, p.Default.StringVal, true)
+
+				for _, pattern := range paramPatterns {
+					stringReplacements[fmt.Sprintf(pattern, p.Name)] = p.Default.StringVal
+				}
+			}
+		}
+	}
+
+	// Overwrite with params from the TaskRun
+	trStrings, trArrays := paramsFromTaskRunForEnv(ctx, tr)
+	fmt.Printf("aprindle-3 - trStrings: %v\n", trStrings)
+	for k, v := range trStrings {
+		// TODO(aaron-prindle) key here shouldn't depend on regex
+		// need to massage key value here to be in regular format
+		addParamAsEnvVar(k, v, false)
+	}
+	// TODO(aaron-prindle) Need to update to fix trArrays
+	fmt.Printf("aprindle-30 - trArrays: %v\n", trArrays)
+	for k, v := range trArrays {
+		for _, s := range v {
+			fmt.Printf("aprindle-30 - k:%v, s:%v\n", k, s)
+			addParamAsEnvVar(k, s, false)
+		}
+		// TODO(aaron-prindle) key here shouldn't depend on regex
+	}
+	fmt.Printf("aprindle-31 - trArrays: %v\n", trArrays)
+	// Add env vars to all containers in the spec
+	for i := range spec.Steps {
+		spec.Steps[i].Env = append(spec.Steps[i].Env, envVars...)
+	}
+
+	// Set and overwrite params with the ones from the TaskRun
+	trStrings, trArrays = paramsFromTaskRun(ctx, tr)
+	fmt.Printf("aprindle-4 - trStrings: %v\n", trStrings)
+	for k, v := range trStrings {
+		stringReplacements[k] = v
+	}
+	for k, v := range trArrays {
+		arrayReplacements[k] = v
+	}
+	for k := range stringReplacements {
+		// TODO(aaron-prindle) need to consider ".env" field/param names?
+		stringReplacements[k+".env"] = convertToEnvVar(k, paramPatterns)
+	}
+	for k, v := range trArrays {
+		nV := []string{}
+		for _, s := range v {
+			nV = append(nV, convertToEnvVar(s, paramPatterns))
+		}
+		arrayReplacements[k+".env"] = nV // TODO(aaron-prindle)
+	}
+
+	fmt.Printf("aprindle-5 - stringReplacements: %v\n", stringReplacements)
+	fmt.Printf("aprindle-50 - arrayReplacements: %v\n", arrayReplacements)
+	// TODO(aaron-prindle) figure out array replacements
+	return ApplyEnvReplacements(spec, stringReplacements, arrayReplacements)
+}
+
+// =====================================================
+// =====================================================
 
 // ApplyParameters applies the params from a TaskRun.Parameters to a TaskSpec
 func ApplyParameters(spec *v1.TaskSpec, tr *v1.TaskRun, defaults ...v1.ParamSpec) *v1.TaskSpec {
@@ -400,4 +528,60 @@ func ApplyReplacements(spec *v1.TaskSpec, stringReplacements map[string]string, 
 	}
 
 	return spec
+}
+
+// ApplyEnvReplacements replaces placeholders for declared parameters with the specified replacements.
+func ApplyEnvReplacements(spec *v1.TaskSpec, stringReplacements map[string]string, arrayReplacements map[string][]string) *v1.TaskSpec {
+	spec = spec.DeepCopy()
+
+	// Apply variable expansion to steps fields.
+	steps := spec.Steps
+	for i := range steps {
+		container.ApplyScriptReplacements(&steps[i], stringReplacements, arrayReplacements)
+	}
+	// TODO(aaron-prindle) might need to update this again for ...
+	// container.ApplyArgsReplacementsForEnv...
+
+	return spec
+}
+
+func convertToEnvVar(test string, patterns []string) string {
+	// Define regex patterns based on the provided patterns
+	regexes := []string{
+		`params\.(\w+)`,
+		// `params\.(\w+)\.(\w+)`,
+		`params\["(\w+)"\]`, // <-- TODO(aaron-prindle) is this allowable?
+		`params\['(\w+)'\]`,
+		`inputs\.params\.(\w+)`,
+	}
+
+	objectRegex := `params\.(\w+)\.(\w+)`
+	// TODO(aaron-prindle) seems nested object not supported, will be possible now to do params.foo.bar.env though?
+
+	regex := regexp.MustCompile(objectRegex)
+	matches := regex.FindStringSubmatch(test)
+	if len(matches) > 2 {
+		fmt.Printf("aprindle-6 - matches: %v\n", matches)
+
+		reg := regexp.MustCompile(`[^a-zA-Z0-9]+`) // TODO(aaron-prindle) add "." char as well?
+		// TODO(aaron-prindle) vvvv needs to be in $(PARAMS_*) vs $PARAMS_* for args: usage to work properly
+		return strings.ToUpper(reg.ReplaceAllString(test, "_"))
+		// return "$" + strings.ToUpper(reg.ReplaceAllString(test, "_"))
+		// return "$" + "(" + strings.ToUpper(reg.ReplaceAllString(test, "_")+")")
+	}
+
+	for _, re := range regexes {
+		regex := regexp.MustCompile(re)
+		matches := regex.FindStringSubmatch(test)
+		if len(matches) > 1 {
+			return toScriptEnvVarFromString(matches[1])
+		}
+	}
+	return ""
+}
+
+// Convert a string to its script ENV var representation with "$PARAMS_" prefix
+func toScriptEnvVarFromString(s string) string {
+	return convertToShellEnvVarFormat(s, true)
+	// return "$" + convertToShellEnvVarFormat(s, true)
 }

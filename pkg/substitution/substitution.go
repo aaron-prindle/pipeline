@@ -237,7 +237,8 @@ func ExtractVariablesFromString(s, prefix string) ([]string, bool, string) {
 			// Invalid Examples:
 			//  - <prefix>.foo.bar.baz....
 			if j == 0 && strings.Contains(val, ".") {
-				if len(strings.Split(val, ".")) > 2 {
+				// TODO(aaron-prindle) - FIX below validation change should be thorough
+				if len(strings.Split(val, ".")) > 2 && !strings.HasSuffix(val, ".env") {
 					errString = fmt.Sprintf(`Invalid referencing of parameters in "%s"! Only two dot-separated components after the prefix "%s" are allowed.`, s, prefix)
 					return vars, true, errString
 				}
@@ -297,6 +298,7 @@ func matchGroups(matches []string, pattern *regexp.Regexp) map[string]string {
 func ApplyReplacements(in string, replacements map[string]string) string {
 	replacementsList := []string{}
 	for k, v := range replacements {
+		//TODO(aaron-prindle) NOTE - .env ordering might make this a bit confusing, maybe not though if it looks at token
 		replacementsList = append(replacementsList, fmt.Sprintf("$(%s)", k), v)
 	}
 	// strings.Replacer does all replacements in one pass, preventing multiple replacements
