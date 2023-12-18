@@ -585,3 +585,70 @@ func toScriptEnvVarFromString(s string) string {
 	return convertToShellEnvVarFormat(s, true)
 	// return "$" + convertToShellEnvVarFormat(s, true)
 }
+
+// TODO(aaron-prindle) these functions were removed @ HEAD, should use the substitute instead
+// ========================================
+func paramsFromTaskRunForEnv(ctx context.Context, tr *v1.TaskRun) (map[string]string, map[string][]string) {
+	// stringReplacements is used for standard single-string stringReplacements, while arrayReplacements contains arrays
+	// that need to be further processed.
+	stringReplacements := map[string]string{}
+	arrayReplacements := map[string][]string{}
+
+	for _, p := range tr.Spec.Params {
+		switch p.Value.Type {
+		case v1.ParamTypeArray:
+			for _, pattern := range paramPatterns {
+				for i := 0; i < len(p.Value.ArrayVal); i++ {
+					stringReplacements[fmt.Sprintf(pattern+"[%d]", p.Name, i)] = p.Value.ArrayVal[i]
+				}
+				arrayReplacements[fmt.Sprintf(pattern, p.Name)] = p.Value.ArrayVal
+			}
+		case v1.ParamTypeObject:
+			for k, v := range p.Value.ObjectVal {
+				// TODO(aaron-prindle) FIX - something here is broken -> PARAM_ARG vs PARAM_ARG_URL
+				fmt.Printf("aprindle-1 - stringReplacements: k,v = %s, %s\n", fmt.Sprintf(objectIndividualVariablePattern, p.Name, k), v)
+				stringReplacements[fmt.Sprintf(objectIndividualVariablePattern, p.Name, k)] = v
+			}
+		case v1.ParamTypeString:
+			fallthrough
+		default:
+			for _, pattern := range paramPatterns {
+				fmt.Printf("aprindle-2 - stringReplacements: k,v = %s, %s\n", fmt.Sprintf(pattern, p.Name), p.Value.StringVal)
+				stringReplacements[fmt.Sprintf(pattern, p.Name)] = p.Value.StringVal
+			}
+		}
+	}
+
+	return stringReplacements, arrayReplacements
+}
+
+func paramsFromTaskRun(ctx context.Context, tr *v1.TaskRun) (map[string]string, map[string][]string) {
+	// stringReplacements is used for standard single-string stringReplacements, while arrayReplacements contains arrays
+	// that need to be further processed.
+	stringReplacements := map[string]string{}
+	arrayReplacements := map[string][]string{}
+
+	for _, p := range tr.Spec.Params {
+		switch p.Value.Type {
+		case v1.ParamTypeArray:
+			for _, pattern := range paramPatterns {
+				for i := 0; i < len(p.Value.ArrayVal); i++ {
+					stringReplacements[fmt.Sprintf(pattern+"[%d]", p.Name, i)] = p.Value.ArrayVal[i]
+				}
+				arrayReplacements[fmt.Sprintf(pattern, p.Name)] = p.Value.ArrayVal
+			}
+		case v1.ParamTypeObject:
+			for k, v := range p.Value.ObjectVal {
+				stringReplacements[fmt.Sprintf(objectIndividualVariablePattern, p.Name, k)] = v
+			}
+		case v1.ParamTypeString:
+			fallthrough
+		default:
+			for _, pattern := range paramPatterns {
+				stringReplacements[fmt.Sprintf(pattern, p.Name)] = p.Value.StringVal
+			}
+		}
+	}
+
+	return stringReplacements, arrayReplacements
+}
